@@ -6,16 +6,20 @@ interface CfD1Statement {
   run(): Promise<unknown>;
 }
 interface CfD1Database { prepare(query: string): CfD1Statement; batch<T = unknown>(statements: CfD1Statement[]): Promise<T[]>; }
-interface CfR2ObjectBody { body: ReadableStream<Uint8Array>; httpEtag?: string; writeHttpMetadata(headers: Headers): void; text(): Promise<string>; }
-interface CfR2Bucket {
-  put(key: string, value: ReadableStream<Uint8Array> | ArrayBuffer | string, options?: {httpMetadata?: {contentType?: string; contentDisposition?: string}; customMetadata?: Record<string,string>}): Promise<unknown>;
-  get(key: string, options?: {range?: {offset: number; length: number}}): Promise<CfR2ObjectBody | null>;
-  delete(key: string): Promise<void>;
+interface S3ObjectResponse {
+  response: Response;
+  body: ReadableStream<Uint8Array> | null;
+  httpEtag: string | null;
+  text(): Promise<string>;
 }
 interface CfFetcher { fetch(request: Request): Promise<Response>; }
 interface Env {
   DB: CfD1Database;
-  FILES: CfR2Bucket;
+  S3_ENDPOINT: string;
+  S3_REGION: string;
+  S3_BUCKET: string;
+  S3_ACCESS_KEY_ID: string;
+  S3_SECRET_ACCESS_KEY: string;
   ASSETS: CfFetcher;
   MAX_FILE_SIZE_MB?: string;
   TURNSTILE_ENABLED?: string;
@@ -26,6 +30,75 @@ type UploadRow = {
   id: string; owner_hash: string; original_name: string; category: string;
   content_type: string; size_bytes: number; object_key: string; created_at: string;
 };
+
+function hex(bytes: ArrayBuffer | Uint8Array) {
+  const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  return Array.from(data, b => b.toString(16).padStart(2, "0")).join("");
+}
+async function sha256Bytes(value: ArrayBuffer | Uint8Array) {
+  return hex(await crypto.subtle.digest("SHA-256", value instanceof Uint8Array ? value : new Uint8Array(value)));
+}
+async function hmac(key: ArrayBuffer | Uint8Array, value: string) {
+  const cryptoKey = await crypto.subtle.importKey("raw", key, {name:"HMAC", hash:"SHA-256"}, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(value)));
+}
+function awsDate(date = new Date()) {
+  return date.toISOString().replace(/[:-]|\.\d{3}/g, "");
+}
+function s3ObjectUrl(env: Env, key: string) {
+  const base = env.S3_ENDPOINT.replace(/\/+$/, "");
+  const encodedKey = key.split("/").map(part => encodeURIComponent(part)).join("/");
+  return new URL(`${base}/${encodeURIComponent(env.S3_BUCKET)}/${encodedKey}`);
+}
+async function s3Request(
+  env: Env,
+  method: "GET" | "PUT" | "DELETE",
+  key: string,
+  options: {body?: ReadableStream<Uint8Array> | ArrayBuffer | string | null; contentType?: string; contentDisposition?: string; range?: string} = {}
+): Promise<Response> {
+  if (!env.S3_ENDPOINT || !env.S3_REGION || !env.S3_BUCKET || !env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY) {
+    throw new Error("Backblaze B2 S3 credentials are not configured");
+  }
+  const url = s3ObjectUrl(env, key);
+  const amzDate = awsDate();
+  const dateStamp = amzDate.slice(0, 8);
+  // UNSIGNED-PAYLOAD streams files without buffering the entire upload in Worker memory.
+  const payloadHash = "UNSIGNED-PAYLOAD";
+  const headers = new Headers({"x-amz-content-sha256": payloadHash, "x-amz-date": amzDate});
+  if (options.contentType) headers.set("Content-Type", options.contentType);
+  if (options.contentDisposition) headers.set("Content-Disposition", options.contentDisposition);
+  if (options.range) headers.set("Range", options.range);
+
+  const signedHeaders = "host;x-amz-content-sha256;x-amz-date";
+  const canonicalHeaders = `host:${url.host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`;
+  const canonicalRequest = [method, url.pathname, url.searchParams.toString(), canonicalHeaders, signedHeaders, payloadHash].join("\n");
+  const scope = `${dateStamp}/${env.S3_REGION}/s3/aws4_request`;
+  const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${scope}\n${await sha256Bytes(new TextEncoder().encode(canonicalRequest))}`;
+  const kDate = await hmac(new TextEncoder().encode(`AWS4${env.S3_SECRET_ACCESS_KEY}`), dateStamp);
+  const kRegion = await hmac(kDate, env.S3_REGION);
+  const kService = await hmac(kRegion, "s3");
+  const kSigning = await hmac(kService, "aws4_request");
+  const signature = hex(await hmac(kSigning, stringToSign));
+  headers.set("Authorization", `AWS4-HMAC-SHA256 Credential=${env.S3_ACCESS_KEY_ID}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`);
+
+  return fetch(url.toString(), {method, headers, body: method === "PUT" ? options.body as BodyInit : undefined});
+}
+async function s3Put(env: Env, key: string, body: ReadableStream<Uint8Array>, contentType: string, contentDisposition: string) {
+  const response = await s3Request(env, "PUT", key, {body, contentType, contentDisposition});
+  if (!response.ok) throw new Error(`Backblaze upload failed with HTTP ${response.status}`);
+  return response;
+}
+async function s3Get(env: Env, key: string, range?: {offset: number; length: number}): Promise<S3ObjectResponse | null> {
+  const response = await s3Request(env, "GET", key, range ? {range: `bytes=${range.offset}-${range.offset + range.length - 1}`} : {});
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Backblaze download failed with HTTP ${response.status}`);
+  return {response, body: response.body, httpEtag: response.headers.get("ETag"), text: () => response.text()};
+}
+async function s3Delete(env: Env, key: string) {
+  const response = await s3Request(env, "DELETE", key);
+  if (!response.ok && response.status !== 404) throw new Error(`Backblaze delete failed with HTTP ${response.status}`);
+}
+
 const COOKIE = "droplink_guest";
 const BLOCKED = new Set(["exe","msi","bat","cmd","com","scr","pif","vbs","vbe","js","jse","ws","wsf","wsc","wsh","ps1","psm1","sh","bash","csh","ksh","dll","sys","drv","bin","apk","ipa","jar","app","dmg","pkg","deb","rpm","hta","cpl","msc","reg","html","htm","xhtml","shtml","svg","php","phtml","asp","aspx","jsp","jspx","cgi","pl","py","rb"]);
 const INLINE_TYPES = new Set(["image/avif","image/gif","image/jpeg","image/png","image/webp","application/pdf","audio/aac","audio/flac","audio/mpeg","audio/mp4","audio/ogg","audio/wav","audio/webm","video/mp4","video/ogg","video/webm","video/quicktime","text/plain","application/json","text/csv"]);
@@ -46,7 +119,7 @@ function publicFile(row:UploadRow) { return {id:row.id,name:row.original_name,ca
 async function serve(request:Request, env:Env):Promise<Response> {
  const url=new URL(request.url); const path=url.pathname;
  if(request.method==="OPTIONS") return new Response(null,{status:204,headers:{"Access-Control-Allow-Origin":url.origin,"Access-Control-Allow-Credentials":"true","Access-Control-Allow-Headers":"Content-Type, X-Upload-Ticket","Access-Control-Allow-Methods":"GET,POST,PUT,DELETE,OPTIONS"}});
- if(path==="/api/uploads/config"&&request.method==="GET") return json({maxFileSizeBytes:maxBytes(env),deletionSupported:true,storageReady:true,databaseReady:true,storageDriver:"r2",blockedExtensions:[...BLOCKED],loginConfigured:false});
+ if(path==="/api/uploads/config"&&request.method==="GET") return json({maxFileSizeBytes:maxBytes(env),deletionSupported:true,storageReady:true,databaseReady:true,storageDriver:"backblaze-b2-s3",blockedExtensions:[...BLOCKED],loginConfigured:false});
  if(path==="/api/uploads/prepare"&&request.method==="POST") {
    let body:any; try{body=await request.json()}catch{return error(400,"INVALID_JSON","Send valid JSON.")}
    const name=cleanName(body?.name); const size=body?.size; if(!name)return error(400,"INVALID_FILENAME","Choose a valid file name."); const ext=extOf(name); if(BLOCKED.has(ext))return error(415,"UNSUPPORTED_FILE_TYPE",`Files of type .${ext} are not allowed.`); if(!Number.isSafeInteger(size)||size<=0)return error(400,"INVALID_SIZE","File size must be greater than zero."); if(size>maxBytes(env))return error(413,"FILE_TOO_LARGE","This file exceeds the current upload limit.");
@@ -61,8 +134,8 @@ async function serve(request:Request, env:Env):Promise<Response> {
    const intent=await env.DB.prepare("SELECT * FROM upload_intents WHERE id=? AND owner_hash=? AND expires_at>=?").bind(id,own.hash,Date.now()).first<any>(); if(!intent)return error(403,"UPLOAD_OWNER_MISMATCH","Upload session expired or belongs to another browser.");
    const len=Number(request.headers.get("Content-Length")); if(!Number.isSafeInteger(len)||len!==intent.size_bytes)return error(400,"UPLOAD_LENGTH_MISMATCH","Uploaded bytes do not match the selected file size."); if(!request.body)return error(400,"EMPTY_BODY","File body is missing.");
    const existing=await env.DB.prepare("SELECT id FROM uploads WHERE id=?").bind(id).first(); if(existing)return error(409,"UPLOAD_ALREADY_USED","Upload session has already been used.");
-   try { await env.FILES.put(intent.object_key,request.body,{httpMetadata:{contentType:intent.content_type,contentDisposition:`inline; filename*=UTF-8''${encodeURIComponent(intent.original_name)}`},customMetadata:{uploadId:id}}); await env.DB.batch([env.DB.prepare("INSERT INTO uploads(id,owner_hash,original_name,category,content_type,size_bytes,object_key) VALUES(?,?,?,?,?,?,?)").bind(id,own.hash,intent.original_name,intent.category,intent.content_type,intent.size_bytes,intent.object_key),env.DB.prepare("DELETE FROM upload_intents WHERE id=?").bind(id)]); const row={id,owner_hash:own.hash,original_name:intent.original_name,category:intent.category,content_type:intent.content_type,size_bytes:intent.size_bytes,object_key:intent.object_key,created_at:new Date().toISOString()} as UploadRow; return json(publicFile(row),201,own.setCookie?{"Set-Cookie":own.setCookie}:{}); }
-   catch(e){await env.FILES.delete(intent.object_key).catch(()=>{}); return error(502,"UPLOAD_FAILED","Storage could not confirm this upload. Please retry.");}
+   try { await s3Put(env,intent.object_key,request.body,intent.content_type,`inline; filename*=UTF-8''${encodeURIComponent(intent.original_name)}`); await env.DB.batch([env.DB.prepare("INSERT INTO uploads(id,owner_hash,original_name,category,content_type,size_bytes,object_key) VALUES(?,?,?,?,?,?,?)").bind(id,own.hash,intent.original_name,intent.category,intent.content_type,intent.size_bytes,intent.object_key),env.DB.prepare("DELETE FROM upload_intents WHERE id=?").bind(id)]); const row={id,owner_hash:own.hash,original_name:intent.original_name,category:intent.category,content_type:intent.content_type,size_bytes:intent.size_bytes,object_key:intent.object_key,created_at:new Date().toISOString()} as UploadRow; return json(publicFile(row),201,own.setCookie?{"Set-Cookie":own.setCookie}:{}); }
+   catch(e){await s3Delete(env,intent.object_key).catch(()=>{}); return error(502,"UPLOAD_FAILED","Storage could not confirm this upload. Please retry.");}
  }
  if(path==="/api/uploads"&&request.method==="GET") {
    const own=await owner(request); const search=(url.searchParams.get("search")||"").trim().slice(0,120); const cat=url.searchParams.get("category")||""; const sort=url.searchParams.get("sort")||"newest"; const offset=Math.max(0,Math.min(100000,Number(url.searchParams.get("offset")||0))); const allowed=new Set(["image","pdf","audio","video","document","archive","other"]); const whereCat=allowed.has(cat)?" AND category = ?":""; const order:Record<string,string>={newest:"created_at DESC",oldest:"created_at ASC",largest:"size_bytes DESC",smallest:"size_bytes ASC",name_asc:"original_name COLLATE NOCASE ASC",name_desc:"original_name COLLATE NOCASE DESC"}; const params:any[]=[own.hash];
@@ -70,9 +143,9 @@ async function serve(request:Request, env:Env):Promise<Response> {
    const result=await env.DB.prepare(sql).bind(...params).all<UploadRow>(); const rows=result.results||[]; return json({files:rows.slice(0,50).map(publicFile),hasMore:rows.length>50,totalCount:undefined,ownerType:"guest",deletionSupported:true},200,own.setCookie?{"Set-Cookie":own.setCookie}:{});
  }
  const textMatch=path.match(/^\/api\/uploads\/([\w-]+)\/text$/); const itemMatch=path.match(/^\/api\/uploads\/([\w-]+)$/);
- if((textMatch||itemMatch)&&request.method==="GET") { const id=(textMatch||itemMatch)![1]; const row=await env.DB.prepare("SELECT * FROM uploads WHERE id=?").bind(id).first<UploadRow>(); if(!row)return error(404,"FILE_NOT_FOUND","File not found."); if(textMatch){const ext=extOf(row.original_name); if(!(row.content_type==="text/plain"||row.content_type==="application/json"||row.content_type==="text/csv"||TEXT_EXT.has(ext)))return error(415,"PREVIEW_NOT_TEXT","This file is not a supported text document."); const object=await env.FILES.get(row.object_key,{range:{offset:0,length:256*1024}}); if(!object)return error(404,"FILE_NOT_FOUND","File content not found."); const text=await object.text(); return new Response(text,{headers:{"Content-Type":"text/plain; charset=utf-8","Cache-Control":"private, max-age=60","X-Content-Type-Options":"nosniff"}}); } return json({...publicFile(row),downloadUrl:publicFile(row).url}); }
- if(itemMatch&&request.method==="DELETE") { const id=itemMatch[1]; const own=await owner(request); const row=await env.DB.prepare("SELECT * FROM uploads WHERE id=? AND owner_hash=?").bind(id,own.hash).first<UploadRow>(); if(!row)return error(404,"FILE_NOT_FOUND","File not found or you do not own it."); await env.DB.prepare("DELETE FROM uploads WHERE id=? AND owner_hash=?").bind(id,own.hash).run(); await env.FILES.delete(row.object_key); return json({id},200,own.setCookie?{"Set-Cookie":own.setCookie}:{}); }
- const fileMatch=path.match(/^\/files\/([\w-]+)\/content$/); if(fileMatch&&request.method==="GET") { const row=await env.DB.prepare("SELECT * FROM uploads WHERE id=?").bind(fileMatch[1]).first<UploadRow>(); if(!row)return error(404,"FILE_NOT_FOUND","File not found."); const object=await env.FILES.get(row.object_key); if(!object)return error(404,"FILE_CONTENT_MISSING","File content not found."); const headers=new Headers(); object.writeHttpMetadata(headers); headers.set("Content-Type",row.content_type); headers.set("X-Content-Type-Options","nosniff"); headers.set("Cache-Control","public, max-age=3600"); headers.set("Content-Disposition",`inline; filename*=UTF-8''${encodeURIComponent(row.original_name)}`); if(object.httpEtag)headers.set("ETag",object.httpEtag); return new Response(object.body,{headers}); }
+ if((textMatch||itemMatch)&&request.method==="GET") { const id=(textMatch||itemMatch)![1]; const row=await env.DB.prepare("SELECT * FROM uploads WHERE id=?").bind(id).first<UploadRow>(); if(!row)return error(404,"FILE_NOT_FOUND","File not found."); if(textMatch){const ext=extOf(row.original_name); if(!(row.content_type==="text/plain"||row.content_type==="application/json"||row.content_type==="text/csv"||TEXT_EXT.has(ext)))return error(415,"PREVIEW_NOT_TEXT","This file is not a supported text document."); const object=await s3Get(env,row.object_key,{offset:0,length:256*1024}); if(!object)return error(404,"FILE_NOT_FOUND","File content not found."); const text=await object.text(); return new Response(text,{headers:{"Content-Type":"text/plain; charset=utf-8","Cache-Control":"private, max-age=60","X-Content-Type-Options":"nosniff"}}); } return json({...publicFile(row),downloadUrl:publicFile(row).url}); }
+ if(itemMatch&&request.method==="DELETE") { const id=itemMatch[1]; const own=await owner(request); const row=await env.DB.prepare("SELECT * FROM uploads WHERE id=? AND owner_hash=?").bind(id,own.hash).first<UploadRow>(); if(!row)return error(404,"FILE_NOT_FOUND","File not found or you do not own it."); await env.DB.prepare("DELETE FROM uploads WHERE id=? AND owner_hash=?").bind(id,own.hash).run(); await s3Delete(env,row.object_key); return json({id},200,own.setCookie?{"Set-Cookie":own.setCookie}:{}); }
+ const fileMatch=path.match(/^\/files\/([\w-]+)\/content$/); if(fileMatch&&request.method==="GET") { const row=await env.DB.prepare("SELECT * FROM uploads WHERE id=?").bind(fileMatch[1]).first<UploadRow>(); if(!row)return error(404,"FILE_NOT_FOUND","File not found."); const object=await s3Get(env,row.object_key); if(!object)return error(404,"FILE_CONTENT_MISSING","File content not found."); const headers=new Headers(); headers.set("Content-Type",row.content_type); headers.set("X-Content-Type-Options","nosniff"); headers.set("Cache-Control","public, max-age=3600"); headers.set("Content-Disposition",`inline; filename*=UTF-8''${encodeURIComponent(row.original_name)}`); if(object.httpEtag)headers.set("ETag",object.httpEtag); return new Response(object.body,{headers}); }
  if(path==="/api/health")return json({ok:true,service:"droplink-cloudflare"});
  return env.ASSETS.fetch(request);
 }
