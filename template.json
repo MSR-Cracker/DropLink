@@ -1,0 +1,26 @@
+{
+  "id": "droplink-full-stack",
+  "name": "DropLink — Direct File Sharing & Preview",
+  "description": "Full-stack file sharing and preview platform developed by MSR_Coder",
+  "developer": {
+    "name": "MSR_Coder",
+    "url": "https://msr-coder.pages.dev"
+  },
+  "capabilities": [
+    "server",
+    "db",
+    "storage",
+    "user"
+  ],
+  "files": [
+    "package.json",
+    "drizzle/schema.ts",
+    "server/db.ts",
+    "server/routers.ts",
+    "client/index.html",
+    "client/src/App.tsx",
+    "client/src/lib/trpc.ts",
+    "client/src/pages/Home.tsx",
+    "server/auth.logout.test.ts"
+  ]
+}
